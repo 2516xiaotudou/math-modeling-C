@@ -1,0 +1,7 @@
+result1 total cost 33408.18, purchase 57580.98
+result2 total cost 11669098.57
+result3 plan 11638443.26 adj 566050.75 emerg 1496928.54 total 13701422.55
+result3 emergency energy 507610.19 kWh
+result4-2 total cost 12209681.94
+result4-3 plan 12136883.71 adj 616652.70 emerg 1703576.26 total 14457112.68
+result4-3 emergency energy 561288.11 kWh
