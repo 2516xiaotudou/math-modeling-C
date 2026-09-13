@@ -1,221 +1,179 @@
-# -*- coding: utf-8 -*-
-"""
-2026 高教社杯 C题  微网与外部电网电力调控策略  —— 求解器
-问题1~4 全解，输出 result1~result4-2/4-3.xlsx
-"""
 import os
 import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
 
-BASE = r'D:\桌面\C题\附件'
-OUTDIR = r'D:\桌面\C题\结果'
-os.makedirs(OUTDIR, exist_ok=True)
+bd = r'D:\桌面\C题\附件'
+od = r'D:\桌面\C题\结果'
+os.makedirs(od, exist_ok=True)
 
-DT = 1.0 / 6.0          # 10分钟 = 1/6 小时
-N = 144                 # 每天时段数
-PMAX = 5000.0 * DT      # 每时段最大充/放能量 kWh = 833.333
-SOC_MIN = 1200.0
-SOC_MAX = 10800.0
-ETA = 0.90              # 充电效率
-SOC0_INIT = 6000.0      # 2025-1-1 0:00 储电量
+h = 1.0 / 6.0
+n = 144
+pm = 5000.0 * h
+lo = 1200.0
+hi = 10800.0
+ef = 0.90
+s0 = 6000.0
 
-# ---------------------------------------------------------------- 数据加载
-df1 = pd.read_excel(os.path.join(BASE, '附件1.xlsx'))
-p1 = df1['电价'].values.astype(float)                       # 144 单日电价
-L1 = df1['小区负载'].values.astype(float)                    # 144 单日负载
-G1 = df1['光伏发电预测功率'].values.astype(float)            # 144 单日光伏预测
-E_L1 = L1 * DT
-E_G1 = G1 * DT
+a1 = pd.read_excel(os.path.join(bd, '附件1.xlsx'))
+pr = a1['电价'].values.astype(float)
+ld = a1['小区负载'].values.astype(float)
+pv = a1['光伏发电预测功率'].values.astype(float)
+el1 = ld * h
+eg1 = pv * h
 
-df2l = pd.read_excel(os.path.join(BASE, '附件2.xlsx'), sheet_name='小区负载')
-df2p = pd.read_excel(os.path.join(BASE, '附件2.xlsx'), sheet_name='光伏发电实际功率')
-load_all = df2l.iloc[:, 1:].values.astype(float)            # (365,144) 实际负载 kW
-pv_actual_all = df2p.iloc[:, 1:].values.astype(float)       # (365,144) 实际光伏 kW
+a2 = pd.read_excel(os.path.join(bd, '附件2.xlsx'), sheet_name='小区负载')
+a3 = pd.read_excel(os.path.join(bd, '附件2.xlsx'), sheet_name='光伏发电实际功率')
+la = a2.iloc[:, 1:].values.astype(float)
+pa = a3.iloc[:, 1:].values.astype(float)
 
-df3 = pd.read_excel(os.path.join(BASE, '附件3.xlsx'))
-df3['日期'] = df3['日期'].ffill()
-fcst = df3.iloc[:, 2:].values.astype(float).reshape(365, 4, 24)   # (365,4,24) 小时级预报
+a4 = pd.read_excel(os.path.join(bd, '附件3.xlsx'))
+a4['日期'] = a4['日期'].ffill()
+fs = a4.iloc[:, 2:].values.astype(float).reshape(365, 4, 24)
 
-df4 = pd.read_excel(os.path.join(BASE, '附件4.xlsx'))
-price_all = df4.iloc[:, 1:].values.astype(float)            # (365,144) 波动电价
+a5 = pd.read_excel(os.path.join(bd, '附件4.xlsx'))
+pc = a5.iloc[:, 1:].values.astype(float)
 
-def expand_hourly(h24):
-    """24小时级 -> 144个10分钟级(每小时内6段取同值)"""
-    return np.repeat(h24, 6)
+def eh(w):
+    return np.repeat(w, 6)
 
-# 每天的光伏预报(0:00发布的整日预报)展开到144
-G0_all = np.array([expand_hourly(fcst[d, 0, :]) for d in range(365)])          # (365,144)
-# 每天"滚动最新预报": 0-6点用0点预报,6-12用6点,12-18用12点,18-24用18点
-G_roll_all = np.empty((365, N))
+g0 = np.array([eh(fs[d, 0, :]) for d in range(365)])
+gr = np.empty((365, n))
 for d in range(365):
-    hourly = np.array([fcst[d, h // 6, h % 6] for h in range(24)])
-    G_roll_all[d] = expand_hourly(hourly)
+    hr = np.array([fs[d, k // 6, k % 6] for k in range(24)])
+    gr[d] = eh(hr)
 
-E_L_all = load_all * DT
-E_G_actual_all = pv_actual_all * DT
-E_G0_all = G0_all * DT
-E_G_roll_all = G_roll_all * DT
+el = la * h
+ea = pa * h
+e0 = g0 * h
+er = gr * h
 
-# ---------------------------------------------------------------- LP 求解器
-def solve_day(E_G, E_L, price, soc0, soc0_free_equal=False):
-    """
-    单日LP。变量: b[144]购电, c[144]充电, d[144]放电, SOC[145]。
-    soc0_free_equal=True 表示 SOC0==SOC144 自由(问题1)；否则 SOC0 固定为 soc0。
-    返回 b,c,d,SOC(数组) 和 目标值。
-    """
-    B, C, D, S = 0, N, 2 * N, 3 * N
-    nv = 3 * N + (N + 1)
-    cobj = np.zeros(nv)
-    cobj[B:B + N] = price                     # min sum price*b
-
+def sd(eg, el2, pr2, s, eq=False):
+    B, C, D, S = 0, n, 2 * n, 3 * n
+    nv = 3 * n + (n + 1)
+    co = np.zeros(nv)
+    co[B:B + n] = pr2
     lb = np.zeros(nv); ub = np.full(nv, np.inf)
-    ub[C:C + N] = PMAX
-    ub[D:D + N] = PMAX
-    lb[S:S + N + 1] = SOC_MIN; ub[S:S + N + 1] = SOC_MAX
-    if not soc0_free_equal:
-        lb[S] = ub[S] = soc0
-
-    A_ub, b_ub, A_eq, b_eq = [], [], [], []
-    # 功率平衡: E_G + b + d - c >= E_L  ->  -b -d +c <= E_G - E_L
-    for t in range(N):
-        row = np.zeros(nv); row[B + t] = -1; row[D + t] = -1; row[C + t] = 1
-        A_ub.append(row); b_ub.append(E_G[t] - E_L[t])
-    # 储能动态: SOC[t+1] - SOC[t] - eta*c[t] + d[t] = 0
-    for t in range(N):
-        row = np.zeros(nv)
-        row[S + t + 1] = 1; row[S + t] = -1; row[C + t] = -ETA; row[D + t] = 1
-        A_eq.append(row); b_eq.append(0.0)
-    if soc0_free_equal:
-        row = np.zeros(nv); row[S] = 1; row[S + N] = -1
-        A_eq.append(row); b_eq.append(0.0)
-
-    res = linprog(cobj, A_ub=np.array(A_ub), b_ub=np.array(b_ub),
-                  A_eq=np.array(A_eq), b_eq=np.array(b_eq),
+    ub[C:C + n] = pm
+    ub[D:D + n] = pm
+    lb[S:S + n + 1] = lo; ub[S:S + n + 1] = hi
+    lb[S] = ub[S] = s
+    au, bu, ae, be = [], [], [], []
+    for t in range(n):
+        r = np.zeros(nv); r[B + t] = -1; r[D + t] = -1; r[C + t] = 1
+        au.append(r); bu.append(eg[t] - el2[t])
+    for t in range(n):
+        r = np.zeros(nv)
+        r[S + t + 1] = 1; r[S + t] = -1; r[C + t] = -ef; r[D + t] = 1
+        ae.append(r); be.append(0.0)
+    if eq:
+        r = np.zeros(nv); r[S] = 1; r[S + n] = -1
+        ae.append(r); be.append(0.0)
+    res = linprog(co, A_ub=np.array(au), b_ub=np.array(bu),
+                  A_eq=np.array(ae), b_eq=np.array(be),
                   bounds=list(zip(lb, ub)), method='highs')
     if not res.success:
-        raise RuntimeError('LP失败: ' + res.message)
+        raise RuntimeError('LP fail: ' + res.message)
     x = res.x
-    return x[B:B + N], x[C:C + N], x[D:D + N], x[S:S + N + 1], res.fun
+    return x[B:B + n], x[C:C + n], x[D:D + n], x[S:S + n + 1], res.fun
 
-def solve_day_real_time(E_G_actual, E_L, price, soc0, b_fixed):
-    """实时段: 购电 b 已锁定为 b_fixed，实际光伏下用储能+紧急购电(5倍)补缺口。
-    返回 e(紧急购电), c, d, SOC, 紧急费用。"""
-    B, C, D, S = 0, N, 2 * N, 3 * N
-    E = 4 * N + 1                  # 紧急购电变量 e[144] (避开 SOC[144] 占用的索引 4N)
-    nv = 4 * N + (N + 1)
-    cobj = np.zeros(nv)
-    cobj[E:E + N] = 5.0 * price     # min sum 5*price*e
-    cobj[C:C + N] = 1e-6           # 微小充电惩罚, 打破退化使充放电量唯一
-
+def st(eg, el2, pr2, s, bf):
+    B, C, D, S = 0, n, 2 * n, 3 * n
+    E = 4 * n + 1
+    nv = 4 * n + (n + 1)
+    co = np.zeros(nv)
+    co[E:E + n] = 5.0 * pr2
+    co[C:C + n] = 1e-6
     lb = np.zeros(nv); ub = np.full(nv, np.inf)
-    ub[C:C + N] = PMAX; ub[D:D + N] = PMAX
-    lb[S:S + N + 1] = SOC_MIN; ub[S:S + N + 1] = SOC_MAX
-    lb[S] = ub[S] = soc0
-
-    A_ub, b_ub, A_eq, b_eq = [], [], [], []
-    # 平衡: E_G_actual + b_fixed + d + e - c >= E_L  -> -d -e +c <= E_G_actual + b_fixed - E_L
-    for t in range(N):
-        row = np.zeros(nv)
-        row[D + t] = -1; row[E + t] = -1; row[C + t] = 1
-        A_ub.append(row); b_ub.append(E_G_actual[t] + b_fixed[t] - E_L[t])
-    for t in range(N):
-        row = np.zeros(nv)
-        row[S + t + 1] = 1; row[S + t] = -1; row[C + t] = -ETA; row[D + t] = 1
-        A_eq.append(row); b_eq.append(0.0)
-    res = linprog(cobj, A_ub=np.array(A_ub), b_ub=np.array(b_ub),
-                  A_eq=np.array(A_eq), b_eq=np.array(b_eq),
+    ub[C:C + n] = pm; ub[D:D + n] = pm
+    lb[S:S + n + 1] = lo; ub[S:S + n + 1] = hi
+    lb[S] = ub[S] = s
+    au, bu, ae, be = [], [], [], []
+    for t in range(n):
+        r = np.zeros(nv)
+        r[D + t] = -1; r[E + t] = -1; r[C + t] = 1
+        au.append(r); bu.append(eg[t] + bf[t] - el2[t])
+    for t in range(n):
+        r = np.zeros(nv)
+        r[S + t + 1] = 1; r[S + t] = -1; r[C + t] = -ef; r[D + t] = 1
+        ae.append(r); be.append(0.0)
+    res = linprog(co, A_ub=np.array(au), b_ub=np.array(bu),
+                  A_eq=np.array(ae), b_eq=np.array(be),
                   bounds=list(zip(lb, ub)), method='highs')
     if not res.success:
-        raise RuntimeError('实时LP失败: ' + res.message)
+        raise RuntimeError('RT LP fail: ' + res.message)
     x = res.x
-    return x[E:E + N], x[C:C + N], x[D:D + N], x[S:S + N + 1], res.fun
+    return x[E:E + n], x[C:C + n], x[D:D + n], x[S:S + n + 1], res.fun
 
-# ---------------------------------------------------------------- 问题1
-b1, c1, d1, SOC1, cost1 = solve_day(E_G1, E_L1, p1, 0.0, soc0_free_equal=True)
-print('===== 问题1 =====')
-print(f'全天购电量 {b1.sum():.2f} kWh, 全天购电费 {cost1:.2f} 元')
-print(f'SOC0 {SOC1[0]:.2f}, SOC144 {SOC1[144]:.2f}')
-print(f'总充电 {c1.sum():.2f} kWh, 总放电 {d1.sum():.2f} kWh')
+b1, c1, d1, s1, ct1 = sd(eg1, el1, pr, s0, eq=True)
+print('P1 buy %.2f cost %.2f' % (b1.sum(), ct1))
+print('P1 SOC0 %.2f SOC144 %.2f' % (s1[0], s1[144]))
+print('P1 chg %.2f dis %.2f' % (c1.sum(), d1.sum()))
 
-# ---------------------------------------------------------------- 问题2
-NDAYS = 365
-b2_all = np.zeros((NDAYS, N)); c2_all = np.zeros((NDAYS, N)); d2_all = np.zeros((NDAYS, N))
-SOC2_traj = np.zeros((NDAYS, N + 1))
-soc = SOC0_INIT
-cost2_total = 0.0
-for d in range(NDAYS):
-    b, c, dd, SOC, cost = solve_day(E_G_actual_all[d], E_L_all[d], p1, soc)
-    b2_all[d] = b; c2_all[d] = c; d2_all[d] = dd; SOC2_traj[d] = SOC
-    soc = SOC[N]
-    cost2_total += cost
-print('===== 问题2 =====')
-print(f'全年(计划)购电费 {cost2_total:.2f} 元')
-print(f'年终SOC {soc:.2f} kWh, 全年紧急购电=0')
+nd = 365
+b2 = np.zeros((nd, n)); c2 = np.zeros((nd, n)); d2 = np.zeros((nd, n))
+s2 = np.zeros((nd, n + 1))
+s = s0
+ct2 = 0.0
+for d in range(nd):
+    b, c, dd, ss, ct = sd(ea[d], el[d], pr, s)
+    b2[d] = b; c2[d] = c; d2[d] = dd; s2[d] = ss
+    s = ss[n]
+    ct2 += ct
+print('P2 cost %.2f' % ct2)
+print('P2 SOC end %.2f' % s)
 
-# ---------------------------------------------------------------- 问题3
-b_plan3 = np.zeros((NDAYS, N)); b_adj3 = np.zeros((NDAYS, N))
-c3_all = np.zeros((NDAYS, N)); d3_all = np.zeros((NDAYS, N))
-e3_all = np.zeros((NDAYS, N)); SOC3_traj = np.zeros((NDAYS, N + 1))
-soc = SOC0_INIT
-cost_plan3 = cost_adj3 = cost_emerg3 = 0.0
-for d in range(NDAYS):
-    p_day = p1
-    # 0:00 计划(用0点预报)
-    bp, _, _, _, _ = solve_day(E_G0_all[d], E_L_all[d], p_day, soc)
-    # 调整(用滚动最新预报)
-    ba, _, _, _, _ = solve_day(E_G_roll_all[d], E_L_all[d], p_day, soc)
-    # 结算: min取正常价 + 少买50% + 多买1.5倍
-    mn = np.minimum(bp, ba)
-    over = np.clip(bp - ba, 0, None)     # 计划>调整(违约)
-    under = np.clip(ba - bp, 0, None)    # 调整>计划(1.5倍)
-    cost_plan3 += float(np.sum(p_day * mn))
-    cost_adj3 += float(np.sum(0.5 * p_day * over + 1.5 * p_day * under))
-    # 实时: 实际光伏下补缺口(5倍)
-    e, cc, dd, SOC, c_emerg = solve_day_real_time(E_G_actual_all[d], E_L_all[d], p_day, soc, ba)
-    b_plan3[d] = bp; b_adj3[d] = ba; e3_all[d] = e
-    c3_all[d] = cc; d3_all[d] = dd; SOC3_traj[d] = SOC
-    soc = SOC[N]
-    cost_emerg3 += c_emerg
-cost3_total = cost_plan3 + cost_adj3 + cost_emerg3
-print('===== 问题3 =====')
-print(f'计划购电费 {cost_plan3:.2f}, 调整费用 {cost_adj3:.2f}, 紧急 {cost_emerg3:.2f}, 合计 {cost3_total:.2f}')
-print(f'全年紧急购电量 {e3_all.sum():.2f} kWh')
+bp3 = np.zeros((nd, n)); ba3 = np.zeros((nd, n))
+c3 = np.zeros((nd, n)); d3 = np.zeros((nd, n))
+e3 = np.zeros((nd, n)); s3 = np.zeros((nd, n + 1))
+s = s0
+cp = ca = ce = 0.0
+for d in range(nd):
+    bpa, _, _, _, _ = sd(e0[d], el[d], pr, s)
+    baa, _, _, _, _ = sd(er[d], el[d], pr, s)
+    mn = np.minimum(bpa, baa)
+    ov = np.clip(bpa - baa, 0, None)
+    un = np.clip(baa - bpa, 0, None)
+    cp += float(np.sum(pr * mn))
+    ca += float(np.sum(0.5 * pr * ov + 1.5 * pr * un))
+    e, cc, dd, ss, cem = st(ea[d], el[d], pr, s, baa)
+    bp3[d] = bpa; ba3[d] = baa; e3[d] = e
+    c3[d] = cc; d3[d] = dd; s3[d] = ss
+    s = ss[n]
+    ce += cem
+print('P3 plan %.2f adj %.2f em %.2f total %.2f' % (cp, ca, ce, cp + ca + ce))
+print('P3 em energy %.2f' % e3.sum())
 
-# ---------------------------------------------------------------- 问题4 (波动电价)
-# 4-2: 对应问题2
-b42_all = np.zeros((NDAYS, N)); c42_all = np.zeros((NDAYS, N)); d42_all = np.zeros((NDAYS, N))
-SOC42 = np.zeros((NDAYS, N + 1))
-soc = SOC0_INIT; cost42 = 0.0
-for d in range(NDAYS):
-    b, c, dd, SOC, cost = solve_day(E_G_actual_all[d], E_L_all[d], price_all[d], soc)
-    b42_all[d] = b; c42_all[d] = c; d42_all[d] = dd; SOC42[d] = SOC
-    soc = SOC[N]; cost42 += cost
-# 4-3: 对应问题3
-b_plan43 = np.zeros((NDAYS, N)); b_adj43 = np.zeros((NDAYS, N))
-c43_all = np.zeros((NDAYS, N)); d43_all = np.zeros((NDAYS, N)); e43_all = np.zeros((NDAYS, N))
-SOC43 = np.zeros((NDAYS, N + 1))
-soc = SOC0_INIT; cp43 = ca43 = ce43 = 0.0
-for d in range(NDAYS):
-    p_day = price_all[d]
-    bp, _, _, _, _ = solve_day(E_G0_all[d], E_L_all[d], p_day, soc)
-    ba, _, _, _, _ = solve_day(E_G_roll_all[d], E_L_all[d], p_day, soc)
-    mn = np.minimum(bp, ba); over = np.clip(bp - ba, 0, None); under = np.clip(ba - bp, 0, None)
-    cp43 += float(np.sum(p_day * mn))
-    ca43 += float(np.sum(0.5 * p_day * over + 1.5 * p_day * under))
-    e, cc, dd, SOC, c_emerg = solve_day_real_time(E_G_actual_all[d], E_L_all[d], p_day, soc, ba)
-    b_plan43[d] = bp; b_adj43[d] = ba; e43_all[d] = e
-    c43_all[d] = cc; d43_all[d] = dd; SOC43[d] = SOC
-    soc = SOC[N]; ce43 += c_emerg
-print('===== 问题4 =====')
-print(f'4-2(波动价·问题2)全年购电费 {cost42:.2f} 元')
-print(f'4-3(波动价·问题3) 计划 {cp43:.2f} + 调整 {ca43:.2f} + 紧急 {ce43:.2f} = {cp43+ca43+ce43:.2f}')
+b42 = np.zeros((nd, n)); c42 = np.zeros((nd, n)); d42 = np.zeros((nd, n))
+s42 = np.zeros((nd, n + 1))
+s = s0; ct42 = 0.0
+for d in range(nd):
+    b, c, dd, ss, ct = sd(ea[d], el[d], pc[d], s)
+    b42[d] = b; c42[d] = c; d42[d] = dd; s42[d] = ss
+    s = ss[n]; ct42 += ct
 
-# 保存中间结果供后续写文件使用
-np.savez(os.path.join(OUTDIR, '_data.npz'),
-         b1=b1, c1=c1, d1=d1, SOC1=SOC1,
-         b2_all=b2_all, c2_all=c2_all, d2_all=d2_all, SOC2_traj=SOC2_traj,
-         b_plan3=b_plan3, b_adj3=b_adj3, c3_all=c3_all, d3_all=d3_all, e3_all=e3_all, SOC3_traj=SOC3_traj,
-         b42_all=b42_all, c42_all=c42_all, d42_all=d42_all, SOC42=SOC42,
-         b_plan43=b_plan43, b_adj43=b_adj43, c43_all=c43_all, d43_all=d43_all, e43_all=e43_all, SOC43=SOC43)
-print('=== 求解完成，中间数据已保存 ===')
+bp43 = np.zeros((nd, n)); ba43 = np.zeros((nd, n))
+c43 = np.zeros((nd, n)); d43 = np.zeros((nd, n)); e43 = np.zeros((nd, n))
+s43 = np.zeros((nd, n + 1))
+s = s0; cp4 = ca4 = ce4 = 0.0
+for d in range(nd):
+    pd = pc[d]
+    bpa, _, _, _, _ = sd(e0[d], el[d], pd, s)
+    baa, _, _, _, _ = sd(er[d], el[d], pd, s)
+    mn = np.minimum(bpa, baa); ov = np.clip(bpa - baa, 0, None); un = np.clip(baa - bpa, 0, None)
+    cp4 += float(np.sum(pd * mn))
+    ca4 += float(np.sum(0.5 * pd * ov + 1.5 * pd * un))
+    e, cc, dd, ss, cem = st(ea[d], el[d], pd, s, baa)
+    bp43[d] = bpa; ba43[d] = baa; e43[d] = e
+    c43[d] = cc; d43[d] = dd; s43[d] = ss
+    s = ss[n]; ce4 += cem
+print('P4 4-2 cost %.2f' % ct42)
+print('P4 4-3 plan %.2f adj %.2f em %.2f total %.2f' % (cp4, ca4, ce4, cp4 + ca4 + ce4))
+
+np.savez(os.path.join(od, '_data.npz'),
+         b1=b1, c1=c1, d1=d1, s1=s1,
+         b2=b2, c2=c2, d2=d2, s2=s2,
+         bp3=bp3, ba3=ba3, c3=c3, d3=d3, e3=e3, s3=s3,
+         b42=b42, c42=c42, d42=d42, s42=s42,
+         bp43=bp43, ba43=ba43, c43=c43, d43=d43, e43=e43, s43=s43)
+print('DONE')
